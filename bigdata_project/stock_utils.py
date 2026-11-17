@@ -1,66 +1,33 @@
+"""
+notify_stock_price.py(하루 3회 알림), collect_daily_close.py(하루 1회 종가 수집)가
+공통으로 쓰는 함수 모음.
+
+네이버 금융 비공식 API(m.stock.naver.com)는 장중이면 실시간 체결가를, 장 시작 전/마감
+후에는 가장 최근 종가를 marketStatus/closePrice 필드로 그대로 돌려주므로, 이 하나의
+엔드포인트로 "현재가 조회"와 "일별 종가 기록"을 모두 처리한다.
+"""
 import os
 import io
 import re
 import time
 import requests
+import holidays
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
-
-
-def resolve_today_price(price: int, is_open: bool, intraday_minutes: list,
-                        daily_closes: list) -> int:
-    """분봉/현재가 조회 결과로 build_price_chart()에 넘길 "오늘" 가격을 결정합니다. 장이
-    닫혀있고(is_open=False) 분봉도 없으면(애프터마켓 마감 20:00 뒤 ~ 다음 날 장 시작 전) 지금 조회한 가격은
-    DB의 마지막 종가와 같은 값이 필연적이므로 None을 돌려줘, "오늘" 점을 따로 안 그리게
-    합니다. 단 daily_closes(과거 종가)가 하나도 없으면 비교할 대상 자체가 없으므로 이 예외는
-    적용하지 않고 현재가를 그대로 살립니다. notify_stock_price.py/dashboard.py가 공유합니다."""
-    # 삼항 표현식(조건부 표현식): "조건이 참이면 price, 거짓이면 None"을 한 줄로 쓴 것.
-    # is_open이 True(장중)면 무조건 살아있는 값이라 그대로 쓰고, is_open이 False라도
-    # intraday_minutes가 비어있지 않으면(애프터마켓 마감 직후라 분봉은 남아있는 경우) 마찬가지로 살려둔다.
-    # 세 번째 조건(not daily_closes)은 "지금 가격은 마지막 종가와 중복이라 뺀다"는 위 근거가
-    # 언제 성립하는지를 따진 것이다 — 비교할 과거 종가가 하나도 없으면 중복될 값 자체가 없으므로
-    # 그 근거가 성립하지 않는다. 이때 현재가는 그 종목의 유일한 데이터이므로 반드시 살려야 하고,
-    # 버리면 그릴 점이 하나도 없어 축과 격자만 있는 빈 그래프가 만들어진다. 새로 추가한 종목이나
-    # collect_daily_close.py가 아직 한 번도 실행되지 않은 최초 실행에서 이 상황이 생긴다.
-    # 위 셋 다 아니면(애프터마켓 마감 20:00 뒤 ~ 다음 날 장 시작 전, 히스토리는 있음) None을 돌려준다. 빈 리스트([])는
-    # 파이썬에서 False로 취급되므로 intraday_minutes/daily_closes만 써도 "비어있는지" 확인이 된다.
-    return price if (is_open or intraday_minutes or not daily_closes) else None
-
-def load_price_history() -> dict:
-    """Turso DB에서 종목별 종가 히스토리를 읽어 {code: [{"date": "YYYYMMDD", "close": 가격}, ...]}
-    형태(날짜 오름차순)로 반환합니다. 예전에는 이 함수가 price_history.json 파일을 읽었지만,
-    Turso로 옮긴 뒤로는 DB에서 직접 SELECT한다."""
-    try:
-        # with 문(컨텍스트 매니저): 블록이 끝나면(정상 종료든 예외든) client.close()가 자동으로
-        # 호출되어 DB 연결이 확실히 정리된다 — 파일을 open()으로 열었을 때와 같은 원리다.
-        with get_turso_client() as client:
-            # ORDER BY code, date: 종목코드 순으로, 같은 종목 안에서는 날짜 오름차순으로 정렬해서
-            # 받아온다 (그래프를 그릴 때 날짜순 정렬이 이미 돼 있어야 하므로 여기서 미리 정렬한다).
-            result = client.execute("SELECT code, date, close FROM price_history ORDER BY code, date")
-    except Exception as e:
-        print(f"❌ Turso DB에서 종가 히스토리를 읽지 못했습니다: {e}")
-        return {}
-
-    history: dict = {}
-    # result.rows는 (code, date, close) 튜플들의 목록이다. for 문에서 (code, date, close)로 바로
-    # 풀어서(unpacking) 받는다.
-    for code, date, close in result.rows:
-        # dict.setdefault(key, [])는 "key가 이미 있으면 그 값을 그대로 쓰고, 없으면 빈 리스트를
-        # 새로 만들어 넣은 뒤 그걸 반환"한다 — 종목별로 리스트를 매번 존재 확인하며 만드는 코드
-        # (if code not in history: history[code] = []) 를 한 줄로 줄인 것이다.
-        history.setdefault(code, []).append({"date": date, "close": close})
-    return history
-
 # pandas/matplotlib은 read_watchlist()/build_price_chart() 안에서 그때그때 import한다.
-# 파일을 열자마자 무거운 패키지를 읽어들이지 않으려는 것이다.
+# 이 모듈에서 텔레그램 관련 함수만 가져다 쓰는 경우에는 이 두 (설치·로딩이 무거운) 패키지가
+# 아예 필요 없는데, 모듈 최상단에서 import하면 그런 경우에도 강제로 설치돼 있어야 한다.
 
 WATCHLIST_FILE = "watchlist.csv"
 NUM_HISTORY_DAYS = 15
-# 시간대를 명시하지 않으면 실행 환경에 따라 날짜가 하루 어긋날 수 있다. 항상 이 KST를 기준으로 쓴다.
+# GitHub Actions 실행 환경은 UTC라 datetime.now()(naive)를 그대로 쓰면 스케줄 시각이 아닌
+# 수동/야간 실행 시 날짜가 하루 어긋날 수 있다. 항상 이 KST를 명시해서 기준 시간대를 고정한다.
 KST = ZoneInfo("Asia/Seoul")
 
+# 이 모듈이 임포트되는 시점에 바로 .env를 로드해야, 아래 os.environ.get() 호출이
+# 호출 스크립트의 import 순서와 무관하게 항상 올바른 값을 읽는다.
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -68,9 +35,55 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 아래 두 함수는 이 스크립트에만 있다 (DB에 쓰는 일은 여기서만 한다).
-# ─────────────────────────────────────────────────────────────────────────────
+# holidays.KR()은 한국 공휴일 날짜(datetime.date 객체)들을 담고 있는 특수한 집합(set)이다.
+# "날짜 in _KR_HOLIDAYS"처럼 in 연산자로 그 날짜가 공휴일인지 바로 물어볼 수 있다.
+_KR_HOLIDAYS = holidays.KR()
+
+
+def is_trading_day(date: datetime = None) -> bool:
+    """평일이면서 한국 공휴일이 아닌 날(=KRX 개장일)인지 확인합니다."""
+    # 함수를 호출할 때 date를 안 넘기면(None) 지금 이 순간(오늘, KST 기준)을 기준으로 판단한다.
+    date = date or datetime.now(KST)
+    # datetime.weekday()는 월요일=0, 화요일=1, ... 일요일=6을 반환한다.
+    # 5(토요일) 이상이면 주말이라는 뜻이므로 거래일이 아니다.
+    if date.weekday() >= 5:  # 5=토요일, 6=일요일
+        return False
+    # datetime(날짜+시각)에서 시각 정보를 뺀 date(날짜만)로 변환해야 holidays 집합과 비교할 수 있다.
+    # "not in"이므로 "공휴일 목록에 없으면 True(거래일)"라는 뜻이다.
+    return date.date() not in _KR_HOLIDAYS
+
+
+def read_watchlist(path: str = WATCHLIST_FILE) -> list:
+    """watchlist.csv를 읽어 종목코드 리스트를 반환합니다. 실패 시 None."""
+    if not os.path.exists(path):
+        print(f"❌ '{path}' 파일이 존재하지 않습니다.")
+        return None
+
+    try:
+        import pandas as pd
+
+        # pd.read_csv()는 CSV 파일을 읽어 표 형태의 자료구조인 DataFrame으로 돌려준다.
+        # dtype={"code": str}을 안 주면 pandas가 "005930"을 숫자로 착각해 앞자리 0을
+        # 없애버린다(5930) — 앞자리에 0이 있는 종목코드가 깨지지 않도록 문자열로 강제한다.
+        watchlist_df = pd.read_csv(path, dtype={"code": str})
+
+        # 컬럼명의 공백을 제거하고 소문자로 통일하여 'code' 컬럼을 찾습니다.
+        watchlist_df.columns = [col.strip().lower() for col in watchlist_df.columns]
+
+        if "code" not in watchlist_df.columns:
+            print("❌ CSV 파일에 'code' 컬럼이 존재하지 않습니다.")
+            return None
+
+        # DataFrame의 "code" 열(Series)을 파이썬 기본 리스트로 변환한다.
+        codes = watchlist_df["code"].tolist()
+        print(f"📋 읽어온 관심 종목 리스트: {codes}")
+        return codes
+
+    except Exception as e:
+        print(f"❌ CSV 파일을 읽는 동안 오류가 발생했습니다: {e}")
+        return None
+
+
 def get_turso_client():
     """Turso(libSQL) DB 클라이언트를 생성하고, price_history 테이블이 없으면 만듭니다.
     libsql_client는 여기서만 필요한 무거운(네트워크 연결) 의존성이라 모듈 최상단이 아니라
@@ -102,6 +115,32 @@ def get_turso_client():
         "PRIMARY KEY (code, date))"
     )
     return client
+
+
+def load_price_history() -> dict:
+    """Turso DB에서 종목별 종가 히스토리를 읽어 {code: [{"date": "YYYYMMDD", "close": 가격}, ...]}
+    형태(날짜 오름차순)로 반환합니다. 예전에는 이 함수가 price_history.json 파일을 읽었지만,
+    Turso로 옮긴 뒤로는 DB에서 직접 SELECT한다."""
+    try:
+        # with 문(컨텍스트 매니저): 블록이 끝나면(정상 종료든 예외든) client.close()가 자동으로
+        # 호출되어 DB 연결이 확실히 정리된다 — 파일을 open()으로 열었을 때와 같은 원리다.
+        with get_turso_client() as client:
+            # ORDER BY code, date: 종목코드 순으로, 같은 종목 안에서는 날짜 오름차순으로 정렬해서
+            # 받아온다 (그래프를 그릴 때 날짜순 정렬이 이미 돼 있어야 하므로 여기서 미리 정렬한다).
+            result = client.execute("SELECT code, date, close FROM price_history ORDER BY code, date")
+    except Exception as e:
+        print(f"❌ Turso DB에서 종가 히스토리를 읽지 못했습니다: {e}")
+        return {}
+
+    history: dict = {}
+    # result.rows는 (code, date, close) 튜플들의 목록이다. for 문에서 (code, date, close)로 바로
+    # 풀어서(unpacking) 받는다.
+    for code, date, close in result.rows:
+        # dict.setdefault(key, [])는 "key가 이미 있으면 그 값을 그대로 쓰고, 없으면 빈 리스트를
+        # 새로 만들어 넣은 뒤 그걸 반환"한다 — 종목별로 리스트를 매번 존재 확인하며 만드는 코드
+        # (if code not in history: history[code] = []) 를 한 줄로 줄인 것이다.
+        history.setdefault(code, []).append({"date": date, "close": close})
+    return history
 
 
 def update_price_history(code: str, date_str: str, close_price: int,
@@ -154,47 +193,6 @@ def update_price_history(code: str, date_str: str, close_price: int,
         # 나도 반드시 실행된다(연결이 계속 열린 채로 남는 걸 방지).
         if own_client:
             client.close()
-
-
-
-
-# 이 파일은 함수로 감싸지 않고 맨 위에서 아래로 순서대로 실행되는 "스크립트" 형태다
-# (notify_stock_price.py처럼 함수로 감싸 재사용할 필요가 없어서 더 단순하게 작성했다).
-# 이 스크립트는 휴장일에 실행돼도 그냥 돈다. 저장할 날짜를 "지금 몇 시인가"가 아니라
-# traded_at(체결 시각)에서 뽑기 때문에, 휴장일에 실행돼도 네이버가 돌려주는 마지막 거래일의
-# 종가가 그 거래일 날짜로 저장된다 — 이미 저장돼 있으면 같은 값으로 덮어쓸 뿐이라(upsert)
-# 중복도 생기지 않는다. 그래서 그 결과 로그에는 실행한 날이 아니라 마지막 거래일 날짜가 찍힌다
-# (예: 광복절에 실행하면 그 전 거래일 날짜가 기록된다). 헷갈릴 수 있지만 그게 맞는 동작이다.
-
-def read_watchlist(path: str = WATCHLIST_FILE) -> list:
-    """watchlist.csv를 읽어 종목코드 리스트를 반환합니다. 실패 시 None."""
-    if not os.path.exists(path):
-        print(f"❌ '{path}' 파일이 존재하지 않습니다.")
-        return None
-
-    try:
-        import pandas as pd
-
-        # pd.read_csv()는 CSV 파일을 읽어 표 형태의 자료구조인 DataFrame으로 돌려준다.
-        # dtype={"code": str}을 안 주면 pandas가 "005930"을 숫자로 착각해 앞자리 0을
-        # 없애버린다(5930) — 앞자리에 0이 있는 종목코드가 깨지지 않도록 문자열로 강제한다.
-        watchlist_df = pd.read_csv(path, dtype={"code": str})
-
-        # 컬럼명의 공백을 제거하고 소문자로 통일하여 'code' 컬럼을 찾습니다.
-        watchlist_df.columns = [col.strip().lower() for col in watchlist_df.columns]
-
-        if "code" not in watchlist_df.columns:
-            print("❌ CSV 파일에 'code' 컬럼이 존재하지 않습니다.")
-            return None
-
-        # DataFrame의 "code" 열(Series)을 파이썬 기본 리스트로 변환한다.
-        codes = watchlist_df["code"].tolist()
-        print(f"📋 읽어온 관심 종목 리스트: {codes}")
-        return codes
-
-    except Exception as e:
-        print(f"❌ CSV 파일을 읽는 동안 오류가 발생했습니다: {e}")
-        return None
 
 
 def fetch_naver_current_price(code: str, retries: int = 2) -> dict:
@@ -370,6 +368,26 @@ def format_rate_badge(price: int, rate: float) -> str:
     if rate < 0:
         return f"{prefix} ▼ {rate}%"
     return f"{prefix} ▫️ 0.0%"
+
+
+def resolve_today_price(price: int, is_open: bool, intraday_minutes: list,
+                        daily_closes: list) -> int:
+    """분봉/현재가 조회 결과로 build_price_chart()에 넘길 "오늘" 가격을 결정합니다. 장이
+    닫혀있고(is_open=False) 분봉도 없으면(애프터마켓 마감 20:00 뒤 ~ 다음 날 장 시작 전) 지금 조회한 가격은
+    DB의 마지막 종가와 같은 값이 필연적이므로 None을 돌려줘, "오늘" 점을 따로 안 그리게
+    합니다. 단 daily_closes(과거 종가)가 하나도 없으면 비교할 대상 자체가 없으므로 이 예외는
+    적용하지 않고 현재가를 그대로 살립니다. notify_stock_price.py/dashboard.py가 공유합니다."""
+    # 삼항 표현식(조건부 표현식): "조건이 참이면 price, 거짓이면 None"을 한 줄로 쓴 것.
+    # is_open이 True(장중)면 무조건 살아있는 값이라 그대로 쓰고, is_open이 False라도
+    # intraday_minutes가 비어있지 않으면(애프터마켓 마감 직후라 분봉은 남아있는 경우) 마찬가지로 살려둔다.
+    # 세 번째 조건(not daily_closes)은 "지금 가격은 마지막 종가와 중복이라 뺀다"는 위 근거가
+    # 언제 성립하는지를 따진 것이다 — 비교할 과거 종가가 하나도 없으면 중복될 값 자체가 없으므로
+    # 그 근거가 성립하지 않는다. 이때 현재가는 그 종목의 유일한 데이터이므로 반드시 살려야 하고,
+    # 버리면 그릴 점이 하나도 없어 축과 격자만 있는 빈 그래프가 만들어진다. 새로 추가한 종목이나
+    # collect_daily_close.py가 아직 한 번도 실행되지 않은 최초 실행에서 이 상황이 생긴다.
+    # 위 셋 다 아니면(애프터마켓 마감 20:00 뒤 ~ 다음 날 장 시작 전, 히스토리는 있음) None을 돌려준다. 빈 리스트([])는
+    # 파이썬에서 False로 취급되므로 intraday_minutes/daily_closes만 써도 "비어있는지" 확인이 된다.
+    return price if (is_open or intraday_minutes or not daily_closes) else None
 
 
 def dedupe_daily_closes(daily_closes: list, today_price: int, intraday_minutes: list) -> list:
