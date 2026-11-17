@@ -547,4 +547,3 @@ def build_price_chart(daily_closes: list, current_price: int = None,
     # 되돌려야, 이 버퍼를 읽는 쪽(sendPhoto, st.image 등)이 처음부터 제대로 읽을 수 있다.
     buffer.seek(0)
     return buffer
-
